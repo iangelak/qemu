@@ -1553,7 +1553,6 @@ static void do_setlk_common(fuse_req_t req, fuse_ino_t nodeid,
         fuse_reply_err(req, EINVAL);
         return;
     }
-
     memset(&fi, 0, sizeof(fi));
     fi.fh = arg->fh;
     fi.lock_owner = arg->owner;
