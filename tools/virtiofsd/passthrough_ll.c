@@ -2128,26 +2128,32 @@ static void lo_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi,
         saverr = errno;
     }
 
+    /*
+     * If virtiofsd is in cleanup mode (e.g., due to a hard-reboot) just
+     * give up the lock and exit without sending anything to the notification
+     * virtqueue
+     */
+    if (se->in_cleanup) {
+        /* Release the locks */
+        lock->l_type = F_UNLCK;
+        lock->l_whence = SEEK_SET;
+        /* Unlock whole file */
+        lock->l_start = lock->l_len = 0;
+        fcntl(ofd, F_OFD_SETLKW, lock);
+        return;
+    }
+
 out:
     lo_inode_put(lo, &inode);
 
     if (!async_lock) {
         fuse_reply_err(req, saverr);
     } else {
-        /*
-         * Before attempting to send any message through
-         * the thread should check if the queue actually
-         * exists
-         */
-        if (!se->in_cleanup) {
-            fuse_lowlevel_notify_lock(se, unique, saverr);
-        } else {
-            /* Release the locks */
-            lock->l_type = F_UNLCK;
-            lock->l_whence = SEEK_SET;
-            /* Unlock whole file */
-            lock->l_start = lock->l_len = 0;
-            fcntl(ofd, F_OFD_SETLKW, lock);
+        ret = fuse_lowlevel_notify_lock(se, unique, saverr);
+        /* If the notification queue is full sleep for 100ms and retry */
+        while (ret < 0) {
+            usleep(100000);
+            ret = fuse_lowlevel_notify_lock(se, unique, saverr);
         }
     }
 }
@@ -2420,9 +2426,22 @@ static void lo_flock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi,
                      int op)
 {
     int res;
+    struct fuse_session *se = req->se;
     (void)ino;
 
     res = flock(lo_fi_fd(req, fi), op);
+
+    /*
+     * If virtiofsd is in cleanup mode (e.g., due to a hard-reboot) just
+     * give up the lock and exit without sending anything to the notification
+     * virtqueue
+     */
+    if (se->in_cleanup) {
+        op = LOCK_UN | LOCK_NB;
+        /* Release the locks */
+        res = flock(lo_fi_fd(req, fi), op);
+        return;
+    }
 
     fuse_reply_err(req, res == -1 ? errno : 0);
 }
