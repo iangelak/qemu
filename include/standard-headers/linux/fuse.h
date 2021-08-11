@@ -179,6 +179,11 @@
  *  7.33
  *  - add FUSE_HANDLE_KILLPRIV_V2, FUSE_WRITE_KILL_SUIDGID, FATTR_KILL_SUIDGID
  *  - add FUSE_OPEN_KILL_SUIDGID
+ *
+ *  7.34
+ *  - add FUSE_HAVE_FSNOTIFY
+ *  - add FUSE_FSNOTIFY_<bits>
+ *  - add fuse_notify_fsnotify_(in,out)
  */
 
 #ifndef _LINUX_FUSE_H
@@ -210,10 +215,69 @@
 #define FUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define FUSE_KERNEL_MINOR_VERSION 33
+#define FUSE_KERNEL_MINOR_VERSION 34
 
 /** The node ID of the root inode */
 #define FUSE_ROOT_ID 1
+
+/** Same bits as the fsnotify subsystem */
+#define FUSE_FSNOTIFY_ACCESS 		0x00000001
+#define FUSE_FSNOTIFY_MODIFY 		0x00000002
+#define FUSE_FSNOTIFY_ATTRIB 		0x00000004
+#define FUSE_FSNOTIFY_CLOSE_WRITE 	0x00000008
+#define FUSE_FSNOTIFY_CLOSE_NOWRITE 	0x00000010
+#define FUSE_FSNOTIFY_OPEN 		0x00000020
+#define FUSE_FSNOTIFY_MOVED_FROM 	0x00000040
+#define FUSE_FSNOTIFY_MOVED_TO 		0x00000080
+#define FUSE_FSNOTIFY_CREATE 		0x00000100
+#define FUSE_FSNOTIFY_DELETE 		0x00000200
+#define FUSE_FSNOTIFY_DELETE_SELF 	0x00000400
+#define FUSE_FSNOTIFY_MOVE_SELF 	0x00000800
+#define FUSE_FSNOTIFY_OPEN_EXEC 	0x00001000
+
+#define FUSE_FSNOTIFY_UNMOUNT 		0x00002000
+#define FUSE_FSNOTIFY_Q_OVERFLOW 	0x00004000
+#define FUSE_FSNOTIFY_IN_IGNORED 	0x00008000
+
+#define FUSE_FSNOTIFY_OPEN_PERM 	0x00010000
+#define FUSE_FSNOTIFY_ACCESS_PERM 	0x00020000
+#define FUSE_FSNOTIFY_OPEN_EXEC_PERM 	0x00040000
+#define FUSE_FSNOTIFY_REMOTE 		0x00800000
+
+#define FUSE_FSNOTIFY_EXCL_UNLINK 	0x04000000
+#define FUSE_FSNOTIFY_EVENT_ON_CHILD 	0x08000000
+
+#define FUSE_FSNOTIFY_DN_RENAME 	0x10000000
+#define FUSE_FSNOTIFY_DN_MULTISHOT 	0x20000000
+#define FUSE_FSNOTIFY_ISDIR 		0x40000000
+#define FUSE_FSNOTIFY_IN_ONESHOT 	0x80000000
+
+#define FUSE_FSNOTIFY_CLOSE (FUSE_FSNOTIFY_CLOSE_WRITE | \
+                             FUSE_FSNOTIFY_CLOSE_NOWRITE)
+
+#define FUSE_FSNOTIFY_MOVE (FUSE_FSNOTIFY_MOVED_FROM | FUSE_FSNOTIFY_MOVED_TO)
+
+#define ALL_FUSE_FSNOTIFY_DIRENT_EVENTS (FUSE_FSNOTIFY_CREATE | \
+                             FUSE_FSNOTIFY_DELETE | FUSE_FSNOTIFY_MOVE)
+
+#define ALL_FUSE_FSNOTIFY_PERM_EVENTS (FUSE_FSNOTIFY_OPEN_PERM | \
+                             FUSE_FSNOTIFY_ACCESS_PERM | \
+			     FUSE_FSNOTIFY_OPEN_EXEC_PERM)
+
+#define FUSE_FSNOTIFY_EVENTS_POSS_ON_CHILD (ALL_FUSE_FSNOTIFY_PERM_EVENTS | \
+                             FUSE_FSNOTIFY_ACCESS | FUSE_FSNOTIFY_MODIFY | \
+			     FUSE_FSNOTIFY_ATTRIB | \
+			     FUSE_FSNOTIFY_CLOSE_WRITE | \
+			     FUSE_FSNOTIFY_CLOSE_NOWRITE | FUSE_FSNOTIFY_OPEN | \
+			     FUSE_FSNOTIFY_OPEN_EXEC)
+
+#define FUSE_FSNOTIFY_SUPPORTED (ALL_FUSE_FSNOTIFY_DIRENT_EVENTS | \
+                             FUSE_FSNOTIFY_EVENTS_POSS_ON_CHILD | \
+			     FUSE_FSNOTIFY_DELETE_SELF | \
+			     FUSE_FSNOTIFY_MOVE_SELF | \
+			     FUSE_FSNOTIFY_DN_RENAME | \
+			     FUSE_FSNOTIFY_UNMOUNT | \
+			     FUSE_FSNOTIFY_IN_IGNORED)
 
 /* Make sure all structures are padded to 64bit boundary, so 32bit
    userspace works under 64bit kernels */
@@ -326,6 +390,7 @@ struct fuse_file_lock {
  *			does not have CAP_FSETID. Additionally upon
  *			write/truncate sgid is killed only if file has group
  *			execute permission. (Same as Linux VFS behavior).
+ * FUSE_HAVE_FSNOTIFY: kernel supports the fsnotify subsystem
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -356,6 +421,7 @@ struct fuse_file_lock {
 #define FUSE_MAP_ALIGNMENT	(1 << 26)
 #define FUSE_SUBMOUNTS		(1 << 27)
 #define FUSE_HANDLE_KILLPRIV_V2	(1 << 28)
+#define FUSE_HAVE_FSNOTIFY	(1 << 30)
 
 /**
  * CUSE INIT request/reply flags
@@ -495,6 +561,7 @@ enum fuse_opcode {
 	FUSE_COPY_FILE_RANGE	= 47,
 	FUSE_SETUPMAPPING	= 48,
 	FUSE_REMOVEMAPPING	= 49,
+	FUSE_FSNOTIFY           = 50,
 
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
@@ -512,6 +579,7 @@ enum fuse_notify_code {
 	FUSE_NOTIFY_RETRIEVE = 5,
 	FUSE_NOTIFY_DELETE = 6,
         FUSE_NOTIFY_LOCK = 7,
+        FUSE_NOTIFY_FSNOTIFY = 8,
 	FUSE_NOTIFY_CODE_MAX,
 };
 
@@ -647,6 +715,20 @@ struct fuse_read_in {
 	uint64_t	lock_owner;
 	uint32_t	flags;
 	uint32_t	padding;
+};
+
+struct fuse_notify_fsnotify_in {
+        uint64_t mask;
+	uint64_t group;
+        uint32_t action;
+        uint32_t padding;
+};
+
+struct fuse_notify_fsnotify_out {
+        uint64_t inode;
+        uint64_t mask;
+        uint32_t namelen;
+        uint32_t cookie;
 };
 
 #define FUSE_COMPAT_WRITE_IN_SIZE 24

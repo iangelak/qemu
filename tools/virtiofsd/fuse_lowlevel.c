@@ -1602,6 +1602,33 @@ static void do_setlkw(fuse_req_t req, fuse_ino_t nodeid,
     do_setlk_common(req, nodeid, iter, 1);
 }
 
+static void do_fsnotify(fuse_req_t req, fuse_ino_t nodeid,
+                      struct fuse_mbuf_iter *iter)
+{
+    struct fuse_notify_fsnotify_in *arg;
+    uint64_t mask;
+    uint64_t group;
+    uint32_t action;
+
+    fuse_log(FUSE_LOG_DEBUG, "Inside the fsnotify function!!!\n");
+
+    arg = fuse_mbuf_iter_advance(iter, sizeof(*arg));
+    if (!arg) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+
+    mask = arg->mask;
+    group = arg->group;
+    action = arg->action;
+
+    if (req->se->op.fsnotify) {
+        req->se->op.fsnotify(req, nodeid, mask, action, group);
+    } else {
+        fuse_reply_err(req, ENOSYS);
+    }
+}
+
 static int find_interrupted(struct fuse_session *se, struct fuse_req *req)
 {
     struct fuse_req *curr;
@@ -1987,6 +2014,9 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
     if (arg->flags & FUSE_HANDLE_KILLPRIV_V2) {
         se->conn.capable |= FUSE_CAP_HANDLE_KILLPRIV_V2;
     }
+    if (arg->flags & FUSE_FSNOTIFY) {
+        se->conn.capable |= FUSE_CAP_FSNOTIFY_SUPPORT;
+    }
 #ifdef HAVE_SPLICE
 #ifdef HAVE_VMSPLICE
     se->conn.capable |= FUSE_CAP_SPLICE_WRITE | FUSE_CAP_SPLICE_MOVE;
@@ -2071,6 +2101,9 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
     }
     if (se->conn.want & FUSE_CAP_POSIX_LOCKS) {
         outarg.flags |= FUSE_POSIX_LOCKS;
+    }
+    if (se->conn.want & FUSE_CAP_FSNOTIFY_SUPPORT) {
+        outarg.flags |= FUSE_HAVE_FSNOTIFY;
     }
     if (se->conn.want & FUSE_CAP_ATOMIC_O_TRUNC) {
         outarg.flags |= FUSE_ATOMIC_O_TRUNC;
@@ -2177,6 +2210,34 @@ int fuse_lowlevel_notify_lock(struct fuse_session *se, uint64_t unique,
     iov[1].iov_base = &outarg;
     iov[1].iov_len = sizeof(outarg);
     return send_notify_iov(se, FUSE_NOTIFY_LOCK, iov, 2);
+}
+
+int fuse_lowlevel_notify_fsnotify(struct fuse_session *se,
+        uint32_t name_len, char *pathname,
+        uint64_t mask, uint32_t cookie, fuse_ino_t ino)
+{
+	struct fuse_notify_fsnotify_out outarg = {0};
+	struct iovec iov[3];
+    int count;
+
+	outarg.mask = mask;
+	outarg.inode = ino;
+    outarg.namelen = name_len;
+    outarg.cookie = cookie;
+
+	iov[1].iov_base = &outarg;
+	iov[1].iov_len = sizeof(outarg);
+
+    if (name_len > 0) {
+        iov[2].iov_base = pathname;
+        iov[2].iov_len = name_len;
+        count = 3;
+    } else {
+        count = 2;
+    }
+
+	fuse_log(FUSE_LOG_DEBUG, "%s: Before sending the notify_iov\n", __func__);
+	return send_notify_iov(se, FUSE_NOTIFY_FSNOTIFY, iov, count);
 }
 
 int fuse_lowlevel_notify_store(struct fuse_session *se, fuse_ino_t ino,
@@ -2294,6 +2355,7 @@ static struct {
     [FUSE_RENAME2] = { do_rename2, "RENAME2" },
     [FUSE_COPY_FILE_RANGE] = { do_copy_file_range, "COPY_FILE_RANGE" },
     [FUSE_LSEEK] = { do_lseek, "LSEEK" },
+    [FUSE_FSNOTIFY] = { do_fsnotify, "FSNOTIFY" },
 };
 
 #define FUSE_MAXOP (sizeof(fuse_ll_ops) / sizeof(fuse_ll_ops[0]))
@@ -2508,6 +2570,55 @@ void fuse_session_destroy(struct fuse_session *se)
     g_free(se);
 }
 
+static void inotify_fd_destroy(gpointer data)
+{
+    struct fuse_inotify_fd *inotify_fd = data;
+    
+    close(inotify_fd->fd);
+    g_free(inotify_fd);
+}
+
+static void inotify_key_destroy(gpointer data)
+{
+    g_free(data);
+}
+
+static guint inotify_inode_hash(gconstpointer key)
+{
+	const struct inotify_inode_key *ikey = key;
+
+	return (guint) (ikey->inotify_fd * ikey->inotify_fd) ^
+                                  ((guint)ikey->nodeid);
+}
+
+static gboolean inotify_inode_equal(gconstpointer a, gconstpointer b)
+{
+    const struct inotify_inode_key *ia = a;
+    const struct inotify_inode_key *ib = b;
+
+    return ia->inotify_fd == ib->inotify_fd && ia->nodeid == ib->nodeid;
+}
+
+/*
+ * TODO: Need a better hash for this since there is a good probability of
+ * collisions
+ */
+static guint inotify_wd_hash(gconstpointer key)
+{
+	const struct inotify_wd_key *wkey = key;
+
+	return (guint) (wkey->inotify_fd * wkey->inotify_fd) ^
+                   ((guint)wkey->wd);
+}
+
+static gboolean inotify_wd_equal(gconstpointer a, gconstpointer b)
+{
+    const struct inotify_wd_key *wa = a;
+    const struct inotify_wd_key *wb = b;
+
+    return wa->inotify_fd == wb->inotify_fd &&
+           wa->wd == wb->wd;
+}
 
 struct fuse_session *fuse_session_new(struct fuse_args *args,
                                       const struct fuse_lowlevel_ops *op,
@@ -2538,6 +2649,19 @@ struct fuse_session *fuse_session_new(struct fuse_args *args,
     se->thread_pool_size = THREAD_POOL_SIZE;
     se->conn.max_write = UINT_MAX;
     se->conn.max_readahead = UINT_MAX;
+    se->in_cleanup = 0;
+    /*
+     * TODO: Add the members of fuse_session related to the fsnotify subsystem
+     * to a separate data structure so that the code looks cleaner
+     */
+    se->epoll_fd = -1;
+    se->inotify_thread_running = 0;
+    se->inotify_fds = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+                                            inotify_fd_destroy);
+    se->wd_to_inode = g_hash_table_new_full(inotify_wd_hash,
+                                inotify_wd_equal, inotify_key_destroy, NULL);
+    se->inode_to_wd = g_hash_table_new_full(inotify_inode_hash,
+                                inotify_inode_equal, inotify_key_destroy, NULL);
 
     /* Parse options */
     if (fuse_opt_parse(args, se, fuse_ll_opts, NULL) == -1) {

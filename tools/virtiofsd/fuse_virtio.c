@@ -21,6 +21,7 @@
 #include "fuse_opt.h"
 #include "fuse_virtio.h"
 
+#include <sys/inotify.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -773,7 +774,6 @@ static struct fv_LockReqInfo *fv_get_request_info(gpointer data,
     const struct fuse_buf *buf;
     struct fuse_in_header inh;
     struct fuse_mbuf_iter iter;
-    struct fuse_lk_in *arg;
     struct fv_LockReqInfo *req_info;
 
     assert(se->bufsize > sizeof(struct fuse_in_header));
@@ -839,6 +839,7 @@ static struct fv_LockReqInfo *fv_get_request_info(gpointer data,
      * threadpool
      */
     if (inh.opcode == FUSE_SETLKW) {
+        struct fuse_lk_in *arg;
         /*
          * First advance to the end of the in header and the start of the
          * payload
@@ -1204,6 +1205,9 @@ static void *fv_queue_thread(void *opaque)
             break;
         }
         if (pf[1].revents) {
+            if (!se->in_cleanup) {
+                se->in_cleanup = 1;
+            }
             fuse_log(FUSE_LOG_INFO, "%s: kill event on queue %d - quitting\n",
                      __func__, qi->qidx);
             break;
@@ -1288,9 +1292,13 @@ static void fv_queue_cleanup_thread(struct fv_VuDev *vud, int qidx)
 {
     int ret;
     struct fv_QueueInfo *ourqi;
+    struct fuse_session *se;
+    int tmp = 0;
 
     assert(qidx < vud->nqueues);
     ourqi = vud->qi[qidx];
+    se = ourqi->virtio_dev->se;
+
     /* qidx == 1 is the notification queue  */
     if (qidx != 1) {
         /* Kill the thread */
@@ -1303,6 +1311,21 @@ static void fv_queue_cleanup_thread(struct fv_VuDev *vud, int qidx)
         if (ret) {
             fuse_log(FUSE_LOG_ERR, "%s: Failed to join thread idx %d err"
                      " %d\n", __func__, qidx, ret);
+        }
+
+        /*
+         * When the request virtqueue exits also wait for the inotify thread to
+         * exit safely
+         */
+        if (qidx == 2) {
+            while (1) {
+                pthread_mutex_lock(&se->lock);
+                tmp = se->inotify_thread_running;
+                pthread_mutex_unlock(&se->lock);
+                if (tmp == 0) {
+                    break;
+                }
+            }
         }
 
         close(ourqi->kill_fd);
@@ -1501,6 +1524,7 @@ int virtio_loop(struct fuse_session *se)
      * Make sure all fv_queue_thread()s quit on exit, as we're about to
      * free virtio dev and fuse session, no one should access them anymore.
      */
+    se->in_cleanup = 1;
     for (int i = 0; i < se->virtio_dev->nqueues; i++) {
         if (!se->virtio_dev->qi[i]) {
             continue;
@@ -1509,6 +1533,7 @@ int virtio_loop(struct fuse_session *se)
         fuse_log(FUSE_LOG_INFO, "%s: Stopping queue %d thread\n", __func__, i);
         fv_queue_cleanup_thread(se->virtio_dev, i);
     }
+    se->in_cleanup = 0;
 
     fuse_log(FUSE_LOG_INFO, "%s: Exit\n", __func__);
 

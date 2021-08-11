@@ -45,6 +45,16 @@ struct fuse_notify_req {
     struct fuse_notify_req *prev;
 };
 
+/*
+ * Struct to store the inotify descriptors for the inotify instances generated
+ * by virtiofsd. The refcount defines the lifetime of the inotify instance. If
+ * the refcount reaches 0 then the inotify instance is deleted.
+ */
+struct fuse_inotify_fd {
+    int fd;
+    uint64_t refcount;
+};
+
 struct fuse_session {
     char *mountpoint;
     volatile int exited;
@@ -75,6 +85,18 @@ struct fuse_session {
     struct fv_VuDev *virtio_dev;
     int thread_pool_size;
     bool notify_enabled;
+
+    /*
+     * Inotify related data structures
+     * TODO: Put these data structures in a separate struct
+     */
+    pthread_t inotify_thread;
+    GHashTable *inotify_fds;
+    GSList *fuse_inotify_fds;
+    GHashTable *wd_to_inode;
+    GHashTable *inode_to_wd;
+    int inotify_thread_running;
+    int epoll_fd;
 };
 
 struct fuse_chan {
@@ -82,6 +104,20 @@ struct fuse_chan {
     int ctr;
     int fd;
     struct fv_QueueInfo *qi;
+};
+
+/*
+ * Keys for looking up the mappings between the inodes and inotify
+ * watch descriptors
+ */
+struct inotify_inode_key {    /* Inode to watch mapping */
+	int inotify_fd;
+	fuse_ino_t nodeid;
+};
+
+struct inotify_wd_key {       /* Watch to inode mapping */
+	int inotify_fd;
+	int wd;
 };
 
 int fuse_send_reply_iov_nofree(fuse_req_t req, int error, struct iovec *iov,
