@@ -183,6 +183,7 @@
  *  7.34
  *  - add FUSE_HAVE_FSNOTIFY
  *  - add FUSE_FSNOTIFY_<bits>
+ *  - add fuse_notify_fsnotify_(in,out)
  */
 
 #ifndef _LINUX_FUSE_H
@@ -389,6 +390,7 @@ struct fuse_file_lock {
  *			does not have CAP_FSETID. Additionally upon
  *			write/truncate sgid is killed only if file has group
  *			execute permission. (Same as Linux VFS behavior).
+ * FUSE_HAVE_FSNOTIFY: kernel supports the fsnotify subsystem
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -419,6 +421,7 @@ struct fuse_file_lock {
 #define FUSE_MAP_ALIGNMENT	(1 << 26)
 #define FUSE_SUBMOUNTS		(1 << 27)
 #define FUSE_HANDLE_KILLPRIV_V2	(1 << 28)
+#define FUSE_HAVE_FSNOTIFY      (1 << 30)
 /**
  * CUSE INIT request/reply flags
  *
@@ -557,6 +560,7 @@ enum fuse_opcode {
 	FUSE_COPY_FILE_RANGE	= 47,
 	FUSE_SETUPMAPPING	= 48,
 	FUSE_REMOVEMAPPING	= 49,
+	FUSE_FSNOTIFY		= 51,
 
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
@@ -574,6 +578,7 @@ enum fuse_notify_code {
 	FUSE_NOTIFY_RETRIEVE = 5,
 	FUSE_NOTIFY_DELETE = 6,
 	FUSE_NOTIFY_LOCK = 7,
+	FUSE_NOTIFY_FSNOTIFY = 8,
 	FUSE_NOTIFY_CODE_MAX,
 };
 
@@ -712,6 +717,20 @@ struct fuse_read_in {
 };
 
 #define FUSE_COMPAT_WRITE_IN_SIZE 24
+
+struct fuse_notify_fsnotify_in {
+	uint64_t mask;
+	uint64_t group;
+	uint32_t action;
+	uint32_t padding;
+};
+
+struct fuse_notify_fsnotify_out {
+	uint64_t inode;
+	uint64_t mask;
+	uint32_t namelen;
+	uint32_t cookie;
+};
 
 struct fuse_write_in {
 	uint64_t	fh;
