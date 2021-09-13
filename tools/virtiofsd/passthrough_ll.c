@@ -54,10 +54,15 @@
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <syslog.h>
+#include <sys/inotify.h>
+#include <sys/epoll.h>
 
 #include "qemu/cutils.h"
 #include "passthrough_helpers.h"
 #include "passthrough_seccomp.h"
+
+#define WHITESPACE " "
+#define MAX_EPOLL_EVENTS 10
 
 /* Keep track of inode posix locks for each owner. */
 struct lo_inode_plock {
@@ -168,6 +173,7 @@ struct lo_data {
     struct lo_map fd_map; /* protected by lo->mutex */
     XattrMapEntry *xattr_map_list;
     size_t xattr_map_nentries;
+    int fsnotify;
 
     /* An O_PATH file descriptor to /proc/self/fd/ */
     int proc_self_fd;
@@ -204,6 +210,8 @@ static const struct fuse_opt lo_opts[] = {
     { "announce_submounts", offsetof(struct lo_data, announce_submounts), 1 },
     { "killpriv_v2", offsetof(struct lo_data, user_killpriv_v2), 1 },
     { "no_killpriv_v2", offsetof(struct lo_data, user_killpriv_v2), 0 },
+    { "fsnotify", offsetof(struct lo_data, fsnotify), 1 },
+    { "no_fsnotify", offsetof(struct lo_data, fsnotify), 0 },
     FUSE_OPT_END
 };
 static bool use_syslog = false;
@@ -631,9 +639,169 @@ static int lo_inode_open(struct lo_data *lo, struct lo_inode *inode,
     return fd;
 }
 
+/*
+ * Function to handle the inotify events generated. If the event read is valid
+ * send it to the guest through the notification queue
+ */
+static void lo_handle_events(struct fuse_session *se, int fd)
+{
+    char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    const struct inotify_event *event;
+    ssize_t len;
+    int wd;
+    fuse_ino_t *nodeid;
+    char name[256];
+
+    for (;;) {
+
+        pthread_mutex_lock(&se->lock);
+        /* First check if the inotify fd is still open when we read form it */
+        if (fcntl(fd, F_GETFD) == -1) {
+            pthread_mutex_unlock(&se->lock);
+            break;
+        }
+
+        len = read(fd, buf, sizeof(buf));
+        if (len == -1 && errno != EAGAIN) {
+            fuse_log(FUSE_LOG_ERR, "%s: Inotify event read error\n", __func__);
+            pthread_mutex_unlock(&se->lock);
+            break;
+        }
+        pthread_mutex_unlock(&se->lock);
+
+        if (len <= 0) {
+            break;
+        }
+
+        /*
+         * Got a series of events so process them. Take the lock to
+         * guarantee that the inode goes away while we are sending the
+         * notifications
+         */
+        pthread_mutex_lock(&se->lock);
+        for (char *ptr = buf; ptr < buf + len;
+             ptr += sizeof(struct inotify_event) + event->len) {
+
+            event = (const struct inotify_event *) ptr;
+            wd = event->wd;
+
+            struct inotify_wd_key wd_key = {
+                .inotify_fd = fd,
+                .wd = wd,
+            };
+
+            /*
+             * First find the inode the event corresponds to. If the inode
+             * does not exist it means it was deleted while we were reading
+             * the event so do not create a notification
+             */
+            fuse_log(FUSE_LOG_DEBUG, "%s: Virtiofsd received an event for fd %d"
+                     " watch %d and mask %lld\n", __func__, fd, wd, event->mask);
+            nodeid = g_hash_table_lookup(se->wd_to_inode, &wd_key);
+
+            if (!nodeid) {
+                continue;
+            }
+
+            /* Everything is good so far so send the event to the guest */
+            if (event->len > 0) {
+                memset(name, 0, 256);
+                strncpy(name, event->name, event->len);
+            }
+            fuse_lowlevel_notify_fsnotify(se, event->len, name, event->mask,
+                                          event->cookie, GPOINTER_TO_UINT(nodeid));
+        }
+        pthread_mutex_unlock(&se->lock);
+    }
+}
+
+/*
+ * Function for the thread that monitors the inotify events. For this instance
+ * epoll is used to monitor the dynamically created/destroyed inotify fds
+ * for incoming events
+ */
+static void *lo_fsnotify_event(void *session)
+{
+    struct fuse_session *se = (struct fuse_session *)session;
+    struct epoll_event events[10];
+    int event_num, i;
+    struct fuse_inotify_fd *inotify_fd;
+    GSList *iter;
+
+    /* Create the epoll instance */
+    se->epoll_fd = epoll_create1(0);
+    if (se->epoll_fd == -1) {
+        fuse_log(FUSE_LOG_ERR, "%s: Failed to create an epoll instance\n",
+                 __func__);
+        return NULL;
+    }
+
+    fuse_log(FUSE_LOG_DEBUG, "%s: Created the epoll_fd:%d\n", __func__,
+             se->epoll_fd);
+
+    /* Mark the thread as running */
+    se->inotify_thread_running = 1;
+
+    while (true) {
+
+        pthread_mutex_lock(&se->lock);
+        if (se->in_cleanup) {
+            fuse_log(FUSE_LOG_DEBUG, "%s: In cleanup...exiting\n", __func__);
+            pthread_mutex_unlock(&se->lock);
+            break;
+        }
+        pthread_mutex_unlock(&se->lock);
+
+        if (se->fuse_inotify_fds == NULL) {
+            continue;
+        }
+
+        pthread_mutex_lock(&se->lock);
+        for (iter = se->fuse_inotify_fds; iter != NULL && !se->in_cleanup;
+             iter = iter->next) {
+
+            struct epoll_event event;
+            inotify_fd = (struct fuse_inotify_fd *)iter->data;
+
+            event.events = EPOLLIN | EPOLLET;
+            event.data.fd = inotify_fd->fd;
+            /* Also add the fd to the epoll instance */
+            epoll_ctl(se->epoll_fd, EPOLL_CTL_ADD, inotify_fd->fd, &event);
+
+        }
+        pthread_mutex_unlock(&se->lock);
+
+        event_num = epoll_wait(se->epoll_fd, events, MAX_EPOLL_EVENTS, 0);
+        if (event_num <= 0){
+            continue;
+        }
+        /* Got events so now process them */
+        for (i = 0; i < event_num; i++) {
+             lo_handle_events(se, events[i].data.fd);
+        }
+    }
+
+    /*
+     * The inotify thread is ready to exit so cleanup everything and mark
+     * the thread as not active
+     */
+    pthread_mutex_lock(&se->lock);
+    close(se->epoll_fd);
+    /* Destroy the 3 hash tables and the list related to inotify */
+    g_hash_table_remove_all(se->inotify_fds);
+    g_hash_table_remove_all(se->wd_to_inode);
+    g_hash_table_remove_all(se->inode_to_wd);
+    g_slist_free(g_steal_pointer(&se->fuse_inotify_fds));
+    se->inotify_thread_running = 0;
+    pthread_mutex_unlock(&se->lock);
+
+    return NULL;
+}
+
 static void lo_init(void *userdata, struct fuse_conn_info *conn)
 {
     struct lo_data *lo = (struct lo_data *)userdata;
+    struct fuse_session *se = container_of(conn, struct fuse_session, conn);
 
     if (conn->capable & FUSE_CAP_EXPORT_SUPPORT) {
         conn->want |= FUSE_CAP_EXPORT_SUPPORT;
@@ -660,6 +828,26 @@ static void lo_init(void *userdata, struct fuse_conn_info *conn)
         } else {
             fuse_log(FUSE_LOG_DEBUG, "lo_init: disabling posix locks\n");
             conn->want &= ~FUSE_CAP_POSIX_LOCKS;
+        }
+    }
+    if (conn->capable & FUSE_CAP_FSNOTIFY_SUPPORT) {
+        if (lo->fsnotify) {
+            conn->want |= FUSE_CAP_FSNOTIFY_SUPPORT;
+            /* Create the inotify thread */
+            if (pthread_create(&se->inotify_thread, NULL,
+                               lo_fsnotify_event, se)) {
+
+                fuse_log(FUSE_LOG_ERR, "lo_init: An error occured while"
+                         " creating the inotify thread...Disabling fsnotify\n");
+                conn->want &= ~FUSE_CAP_FSNOTIFY_SUPPORT;
+            } else {
+                fuse_log(FUSE_LOG_DEBUG, "lo_init: activating fsnotify"
+                         "support\n");
+                pthread_detach(se->inotify_thread);
+            }
+        } else {
+            fuse_log(FUSE_LOG_DEBUG, "lo_init: disabling fsnotify support\n");
+            conn->want &= ~FUSE_CAP_FSNOTIFY_SUPPORT;
         }
     }
 
@@ -3792,6 +3980,7 @@ int main(int argc, char *argv[])
         .allow_direct_io = 0,
         .proc_self_fd = -1,
         .user_killpriv_v2 = -1,
+        .fsnotify = 0,
     };
     struct lo_map_elem *root_elem;
     struct lo_map_elem *reserve_elem;
