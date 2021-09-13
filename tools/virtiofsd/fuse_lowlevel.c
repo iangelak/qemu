@@ -2568,6 +2568,55 @@ void fuse_session_destroy(struct fuse_session *se)
     g_free(se);
 }
 
+static void inotify_fd_destroy(gpointer data)
+{
+    struct fuse_inotify_fd *inotify_fd = data;
+
+    close(inotify_fd->fd);
+    g_free(inotify_fd);
+}
+
+static void inotify_key_destroy(gpointer data)
+{
+    g_free(data);
+}
+
+static guint inotify_inode_hash(gconstpointer key)
+{
+	const struct inotify_inode_key *ikey = key;
+
+	return (guint) (ikey->inotify_fd * ikey->inotify_fd) ^
+                                  ((guint)ikey->nodeid);
+}
+
+static gboolean inotify_inode_equal(gconstpointer a, gconstpointer b)
+{
+    const struct inotify_inode_key *ia = a;
+    const struct inotify_inode_key *ib = b;
+
+    return ia->inotify_fd == ib->inotify_fd && ia->nodeid == ib->nodeid;
+}
+
+/*
+ * TODO: Need a better hash for this since there is a good probability of
+ * collisions
+ */
+static guint inotify_wd_hash(gconstpointer key)
+{
+	const struct inotify_wd_key *wkey = key;
+
+	return (guint) (wkey->inotify_fd * wkey->inotify_fd) ^
+                   ((guint)wkey->wd);
+}
+
+static gboolean inotify_wd_equal(gconstpointer a, gconstpointer b)
+{
+    const struct inotify_wd_key *wa = a;
+    const struct inotify_wd_key *wb = b;
+
+    return wa->inotify_fd == wb->inotify_fd &&
+           wa->wd == wb->wd;
+}
 
 struct fuse_session *fuse_session_new(struct fuse_args *args,
                                       const struct fuse_lowlevel_ops *op,
@@ -2598,6 +2647,20 @@ struct fuse_session *fuse_session_new(struct fuse_args *args,
     se->thread_pool_size = THREAD_POOL_SIZE;
     se->conn.max_write = UINT_MAX;
     se->conn.max_readahead = UINT_MAX;
+    se->in_cleanup = 0;
+    /*
+     * TODO: Add the members of fuse_session related to the fsnotify subsystem
+     * to a separate data structure so that the code looks cleaner
+     */
+    se->epoll_fd = -1;
+    se->inotify_thread_running = 0;
+    se->inotify_fds = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+                                            inotify_fd_destroy);
+    se->wd_to_inode = g_hash_table_new_full(inotify_wd_hash, inotify_wd_equal,
+                                            inotify_key_destroy, NULL);
+    se->inode_to_wd = g_hash_table_new_full(inotify_inode_hash,
+                                            inotify_inode_equal,
+                                            inotify_key_destroy, NULL);
 
     /* Parse options */
     if (fuse_opt_parse(args, se, fuse_ll_opts, NULL) == -1) {
