@@ -114,6 +114,12 @@ static const int syscall_allowlist[] = {
     SCMP_SYS(utimensat),
     SCMP_SYS(write),
     SCMP_SYS(writev),
+    SCMP_SYS(inotify_init1),
+    SCMP_SYS(inotify_add_watch),
+    SCMP_SYS(inotify_rm_watch),
+    SCMP_SYS(epoll_create1),
+    SCMP_SYS(epoll_ctl),
+    SCMP_SYS(epoll_wait),
 };
 
 /* Syscalls used when --syslog is enabled */
