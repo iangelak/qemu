@@ -118,6 +118,7 @@ struct lo_inode {
     GHashTable *posix_locks; /* protected by lo_inode->plock_mutex */
 
     mode_t filetype;
+    int fsnotify_watch; /* The fsnotify watch placed on this object */
 };
 
 struct lo_cred {
@@ -1079,6 +1080,7 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
         inode->key.ino = e->attr.st_ino;
         inode->key.dev = e->attr.st_dev;
         inode->key.mnt_id = mnt_id;
+	inode->fsnotify_watch = -1;
         if (lo->posix_lock) {
             pthread_mutex_init(&inode->plock_mutex, NULL);
             inode->posix_locks = g_hash_table_new_full(
