@@ -2002,6 +2002,9 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
     if (arg->flags & FUSE_SETXATTR_EXT) {
         se->conn.capable |= FUSE_CAP_SETXATTR_EXT;
     }
+    if (arg->flags & FUSE_FSNOTIFY) {
+        se->conn.capable |= FUSE_CAP_FSNOTIFY_SUPPORT;
+    }
 #ifdef HAVE_SPLICE
 #ifdef HAVE_VMSPLICE
     se->conn.capable |= FUSE_CAP_SPLICE_WRITE | FUSE_CAP_SPLICE_MOVE;
@@ -2139,6 +2142,10 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
 
     if (se->conn.want & FUSE_CAP_SETXATTR_EXT) {
         outarg.flags |= FUSE_SETXATTR_EXT;
+    }
+
+    if (se->conn.want & FUSE_CAP_FSNOTIFY_SUPPORT) {
+        outarg.flags |= FUSE_HAVE_FSNOTIFY;
     }
 
     fuse_log(FUSE_LOG_DEBUG, "   INIT: %u.%u\n", outarg.major, outarg.minor);
