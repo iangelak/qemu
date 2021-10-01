@@ -134,6 +134,7 @@ void fuse_session_process_buf_int(struct fuse_session *se,
                                   struct fuse_bufvec *bufv,
                                   struct fuse_chan *ch);
 
+void fuse_inotify_init(struct fuse_session *se);
 
 #define FUSE_MAX_MAX_PAGES 256
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32

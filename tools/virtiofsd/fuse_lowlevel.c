@@ -2640,6 +2640,8 @@ static gboolean inotify_wd_equal(gconstpointer a, gconstpointer b)
 void fuse_inotify_init(struct fuse_session *se)
 {
     se->inotify = g_new0(struct fuse_inotify, 1);
+    /* Set the in cleanup flag to inactive */
+    se->inotify->cleanup_inotify = 0;
     /* Initialize the epoll file descriptor */
     se->inotify->epoll_fd = -1;
     /* Mark the inotify as not running yet */
