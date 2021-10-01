@@ -648,6 +648,266 @@ static int lo_inode_open(struct lo_data *lo, struct lo_inode *inode,
 }
 
 /*
+ * The lock to the session is already held when calling this function thus
+ * it is safe to create the inotify instance and add it to the hash tables
+ */
+static struct fuse_inotify_fd *lo_inotify_init(void *session,
+                                               uint64_t group)
+{
+    struct fuse_session *se = (struct fuse_session *)session;
+    struct fuse_inotify_fd *inotify_fd;
+
+    /* Create a new inotify instance */
+    inotify_fd = g_new0(struct fuse_inotify_fd, 1);
+    inotify_fd->fd = inotify_init1(IN_NONBLOCK);
+
+    if (inotify_fd->fd == -1) {
+        fuse_log(FUSE_LOG_ERR, "%s: Inotify event read error\n", __func__);
+        g_free(inotify_fd);
+        return NULL;
+    }
+
+    fuse_log(FUSE_LOG_DEBUG, "%s: Created inotify instance %d\n",
+             __func__, inotify_fd->fd);
+
+    /*
+     * Insert the new inotify fd to the hash table of fds
+     * to have a mapping between the user space inotify fd and the fuse
+     * inotify fd
+     */
+    g_hash_table_insert(se->inotify->inotify_fds, GUINT_TO_POINTER(group),
+                        inotify_fd);
+
+    /*
+     * Add the fd to the list of active inotify fds so we can poll it for
+     * events
+     */
+    se->inotify->inotify_fd_list = g_slist_append(se->inotify->inotify_fd_list,
+                                          inotify_fd);
+
+    return inotify_fd;
+}
+
+/*
+ * Function to cleanup a mapping from watch to inode and the opposite,
+ * from the hash tables
+ */
+static void cleanup_hashtables(struct fuse_session *se, int inotify_fd,
+                               int wd)
+{
+    gpointer *orig_key = NULL, *value = NULL;
+
+    struct inotify_wd_key wd_key = {
+        .inotify_fd = inotify_fd,
+        .wd = wd,
+    };
+
+    /*struct inotify_inode_key inode_key = {*/
+        /*.inotify_fd = inotify_fd,*/
+        /*.nodeid = ino,*/
+    /*};*/
+
+    if (g_hash_table_lookup_extended(se->inotify->wd_to_inode, &wd_key,
+                                     orig_key, value)) {
+        g_hash_table_remove(se->inotify->wd_to_inode, &wd_key);
+    }
+
+    /*if (g_hash_table_lookup_extended(se->inotify->inode_to_wd, &inode_key,*/
+                                     /*orig_key, value)) {*/
+        /*g_hash_table_remove(se->inotify->inode_to_wd, &inode_key);*/
+    /*}*/
+}
+
+static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
+{
+    struct fuse_session *se = req->se;
+    struct fuse_inotify_fd *inotify_fd = NULL;
+    struct inotify_inode_key *inode_key = NULL;
+    struct inotify_wd_key *wd_key = NULL;
+    struct lo_data *lo;
+    struct lo_inode *inode;
+    char procname[64];
+    char linkname[256];
+    int ret = -1, wd;
+    int *inode_exists;
+    /*int *wd_exists;*/
+    uint64_t group = 0;
+
+    if (mask && !(mask & FUSE_FSNOTIFY_SUPPORTED)) {
+        fuse_log(FUSE_LOG_ERR, "%s: Fsnotify event not supported\n", __func__);
+        errno = EINVAL;
+        goto out;
+    }
+
+    pthread_mutex_lock(&se->inotify->i_lock);
+
+    /* First search the hash table for the inotify instance */
+    inotify_fd = g_hash_table_lookup(se->inotify->inotify_fds,
+                                     GUINT_TO_POINTER(group));
+    /*
+     * No previous inotify instance for the "group" identifier exists so
+     * create it
+     */
+    if (!inotify_fd) {
+        inotify_fd = lo_inotify_init(se, group);
+        if (!inotify_fd) {
+            errno = EBADF;
+            goto out;
+        }
+    }
+
+    /* Get the inode on which we are going to add/remove the watch on/from */
+    inode = lo_inode(req, ino);
+    if (!inode) {
+        fuse_log(FUSE_LOG_DEBUG, "%s: Inode %llu is NULL\n", __func__, ino);
+        errno = ENOENT;
+        goto out;
+    }
+
+    /* Key for inode to watch mapping */
+    inode_key = g_new0(struct inotify_inode_key, 1);
+    inode_key->inotify_fd = inotify_fd->fd;
+    inode_key->nodeid = ino;
+
+    /* Action 0: Remove watch, Action 1: Add/modify watch */
+    switch (mask) {
+        /* Remove the watch */
+        case 0:
+            /*
+             * First check if a watch descriptor is already placed on the inode
+             * so that it is removed. If not then that is an invalid request
+             * from the guest so return an error
+             */
+
+            if (inode->fsnotify_watch == -1) {
+                fuse_log(FUSE_LOG_ERR, "%s: Invalid watch descriptor to be"
+                         " removed from inode %lu\n", __func__, ino);
+                errno = EINVAL;
+                goto cleanup_keys;
+            }
+            /* Get the existing watch */
+            wd = inode->fsnotify_watch;
+            fuse_log(FUSE_LOG_DEBUG, "%s: Removing watch %d\n", __func__, wd);
+
+            /* Remove the watch now */
+            ret = inotify_rm_watch(inotify_fd->fd, wd);
+            if (ret < 0) {
+                fuse_log(FUSE_LOG_ERR, "%s: Failed to remove watch"
+                         " descriptor %d\n", __func__, wd);
+                /*
+                 * Ignore the error for now. Probably it means that the kernel
+                 * deleted the watches on the inode prior to us so no need to
+                 * do anything than clean the hashtables for the mappings
+                 */
+            }
+
+            /*
+             * Reduce the refcount of the inotify intstance when
+             * removing a watch
+             */
+            if (inotify_fd->refcount > 0) {
+                inotify_fd->refcount--;
+            }
+
+            /* Now try to remove the keys/values from the hashtables */
+            cleanup_hashtables(se, inotify_fd->fd, wd);
+	    inode->fsnotify_watch = -1;
+
+            break;
+        default:
+            /*
+             * Since we need the name of the file/dir as an argument to the
+             * inotify_add_watch system call, we need to get a name that
+             * corresponds to the inode. So use readlinkat
+             */
+
+            lo = lo_data(req);
+            snprintf(procname, 64, "%i", inode->fd);
+            ret = readlinkat(lo->proc_self_fd, procname, linkname, 256);
+            if (ret < 0) {
+                fuse_log(FUSE_LOG_ERR, "%s: readlinkat failed\n", __func__);
+                goto cleanup_keys;
+            }
+            linkname[ret] = '\0';
+
+            fuse_log(FUSE_LOG_DEBUG, "%s: Adding a watch to file %s\n",
+                     __func__, linkname);
+            /* Add a watch to the file (inode) */
+            wd = inotify_add_watch(inotify_fd->fd, linkname, mask);
+            if (wd < 0) {
+                fuse_log(FUSE_LOG_ERR, "%s: Failed to add watch"
+                         " descriptor on inode %lu\n", __func__, ino);
+                goto cleanup_keys;
+            }
+
+            /* Key for watch to inode mapping */
+            wd_key = g_new0(struct inotify_wd_key, 1);
+            wd_key->inotify_fd = inotify_fd->fd;
+            wd_key->wd = wd;
+
+            /*
+             * Checking if the watch is already mapped to the inode. If yes
+             * then we have a watch modification and not addition
+             */
+            inode_exists = g_hash_table_lookup(se->inotify->wd_to_inode,
+                                               wd_key);
+            if (inode_exists) {
+                ret = 0;
+                fuse_log(FUSE_LOG_DEBUG, "%s: The mapping from wd:%d to"
+                         " inode: %lld already exists\n", __func__, wd, ino);
+                goto cleanup_keys;
+            }
+
+            /*
+             * Add a map from the watch to the inode and one map from the inode
+             * to the watch. These will be used to quickly find which watch
+             * corresponds to which inode and the opposite. Each entry is per
+             * inotify_fd, meaning that for each different inotify_fd we can
+             * have a watch on the same inode
+             */
+            g_hash_table_insert(se->inotify->wd_to_inode, wd_key,
+                                GUINT_TO_POINTER(ino));
+            /*g_hash_table_insert(se->inotify->inode_to_wd, inode_key,*/
+                                /*GUINT_TO_POINTER(wd));*/
+
+            inode->fsnotify_watch = wd;
+            /*
+             * Increase the refcount of the inotify instance when adding a
+             * new watch
+             */
+            inotify_fd->refcount += 1;
+            goto out;
+    }
+
+cleanup_keys:
+    /*if (inode_key) {*/
+        /*g_free(inode_key);*/
+    /*}*/
+    if (wd_key) {
+        g_free(wd_key);
+    }
+out:
+    /*
+     * In this case the inotify instance does not have any watches attached
+     * to it so it is safe to remove it. If a new watch is placed on the
+     * same inotify instance in the guest afterwards, then a new inotify_fd
+     * will be created on virtiofsd
+     */
+    if (inotify_fd->refcount == 0) {
+        fuse_log(FUSE_LOG_DEBUG, "%s: Deleting inotify->fd %d\n",
+                 __func__, inotify_fd->fd);
+        g_hash_table_remove(se->inotify->inotify_fds, GUINT_TO_POINTER(group));
+        se->inotify->inotify_fd_list = \
+                                g_slist_remove(se->inotify->inotify_fd_list,
+                                               inotify_fd);
+        close(inotify_fd->fd);
+    }
+
+    pthread_mutex_unlock(&se->inotify->i_lock);
+    fuse_reply_err(req, ret < 0 ? errno : 0);
+}
+
+/*
  * Function to handle the inotify events generated. If the event read is valid
  * send it to the guest through the notification queue
  */
@@ -700,7 +960,7 @@ static void lo_handle_events(struct fuse_session *se, int fd)
              */
             fuse_log(FUSE_LOG_DEBUG, "%s: Virtiofsd received an event for fd %d"
                      " watch %d and mask %lld\n", __func__, fd, wd, event->mask);
-            nodeid = g_hash_table_lookup(se->wd_to_inode, &wd_key);
+            nodeid = g_hash_table_lookup(se->inotify->wd_to_inode, &wd_key);
 
             if (!nodeid) {
                 continue;
@@ -791,12 +1051,14 @@ static void *lo_fsnotify_event(void *session)
             event.events = EPOLLIN | EPOLLET;
             event.data.fd = inotify_fd->fd;
             /* Also add the fd to the epoll instance */
-            epoll_ctl(se->epoll_fd, EPOLL_CTL_ADD, inotify_fd->fd, &event);
+            epoll_ctl(se->inotify->epoll_fd, EPOLL_CTL_ADD, inotify_fd->fd,
+                      &event);
         }
         pthread_mutex_unlock(&se->inotify->i_lock);
 
         /* Poll the inotify fds for events */
-        event_num = epoll_wait(se->epoll_fd, events, MAX_EPOLL_EVENTS, 0);
+        event_num = epoll_wait(se->inotify->epoll_fd, events,
+                               MAX_EPOLL_EVENTS, 0);
         if (event_num <= 0){
             continue;
         }
@@ -3669,6 +3931,7 @@ static struct fuse_lowlevel_ops lo_oper = {
 #endif
     .lseek = lo_lseek,
     .destroy = lo_destroy,
+    .fsnotify = lo_fsnotify,
 };
 
 /* Print vhost-user.json backend program capabilities */
