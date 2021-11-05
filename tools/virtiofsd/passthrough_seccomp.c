@@ -127,6 +127,8 @@ static const int syscall_allowlist[] = {
     SCMP_SYS(epoll_create1),
     SCMP_SYS(epoll_ctl),
     SCMP_SYS(epoll_wait),
+    SCMP_SYS(fanotify_init),
+    SCMP_SYS(fanotify_mark),
 };
 
 /* Syscalls used when --syslog is enabled */

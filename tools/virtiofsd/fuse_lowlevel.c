@@ -2220,6 +2220,7 @@ int fuse_lowlevel_notify_lock(struct fuse_session *se, uint64_t unique,
     struct fuse_notify_lock_out outarg = {0};
     struct iovec iov[2];
 
+    fuse_log(FUSE_LOG_DEBUG, "%s: In HERE\n", __func__);
     outarg.unique = unique;
     outarg.error = -error;
 
@@ -2628,7 +2629,7 @@ static guint inotify_wd_hash(gconstpointer key)
 	const struct inotify_wd_key *wkey = key;
 
 	return (guint) (wkey->inotify_fd * wkey->inotify_fd) ^
-                        ((guint)wkey->wd);
+                        ((uint64_t)wkey->name);
 }
 
 static gboolean inotify_wd_equal(gconstpointer a, gconstpointer b)
@@ -2637,7 +2638,7 @@ static gboolean inotify_wd_equal(gconstpointer a, gconstpointer b)
     const struct inotify_wd_key *wb = b;
 
     return wa->inotify_fd == wb->inotify_fd &&
-           wa->wd == wb->wd;
+           wa->name == wb->name;
 }
 
 void fuse_inotify_init(struct fuse_session *se)

@@ -56,6 +56,7 @@
 #include <syslog.h>
 #include <grp.h>
 #include <sys/inotify.h>
+#include <sys/fanotify.h>
 #include <sys/epoll.h>
 
 #include "qemu/cutils.h"
@@ -659,9 +660,10 @@ static struct fuse_inotify_fd *lo_inotify_init(void *session,
 
     /* Create a new inotify instance */
     inotify_fd = g_new0(struct fuse_inotify_fd, 1);
-    inotify_fd->fd = inotify_init1(IN_NONBLOCK);
+    inotify_fd->fd = fanotify_init(FAN_NONBLOCK | FAN_REPORT_FID, O_RDONLY | O_LARGEFILE);
 
     if (inotify_fd->fd == -1) {
+	perror("fanotify_init");
         fuse_log(FUSE_LOG_ERR, "%s: Inotify event read error\n", __func__);
         g_free(inotify_fd);
         return NULL;
@@ -693,29 +695,19 @@ static struct fuse_inotify_fd *lo_inotify_init(void *session,
  * from the hash tables
  */
 static void cleanup_hashtables(struct fuse_session *se, int inotify_fd,
-                               int wd)
+                               char *filename)
 {
     gpointer *orig_key = NULL, *value = NULL;
 
     struct inotify_wd_key wd_key = {
         .inotify_fd = inotify_fd,
-        .wd = wd,
+        .name = filename,
     };
-
-    /*struct inotify_inode_key inode_key = {*/
-        /*.inotify_fd = inotify_fd,*/
-        /*.nodeid = ino,*/
-    /*};*/
 
     if (g_hash_table_lookup_extended(se->inotify->wd_to_inode, &wd_key,
                                      orig_key, value)) {
         g_hash_table_remove(se->inotify->wd_to_inode, &wd_key);
     }
-
-    /*if (g_hash_table_lookup_extended(se->inotify->inode_to_wd, &inode_key,*/
-                                     /*orig_key, value)) {*/
-        /*g_hash_table_remove(se->inotify->inode_to_wd, &inode_key);*/
-    /*}*/
 }
 
 static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask, uint32_t generation)
@@ -727,9 +719,11 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask, uint32_t 
     struct lo_inode *inode;
     char procname[64];
     char linkname[256];
-    int ret = -1, wd;
+    int ret = -1, wd, mnt_id;
     struct fuse_inode_info *inode_exists;
     uint64_t group = 0;
+    struct file_handle *f_handle = NULL;
+    const int dirfd = AT_FDCWD;
 
     if (mask && !(mask & FUSE_FSNOTIFY_SUPPORTED)) {
         fuse_log(FUSE_LOG_ERR, "%s: Fsnotify event not supported\n", __func__);
@@ -763,36 +757,41 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask, uint32_t 
         goto out;
     }
 
-    /* Key for inode to watch mapping */
-    // inode_key = g_new0(struct inotify_inode_key, 1);
-    // inode_key->inotify_fd = inotify_fd->fd;
-    // inode_key->nodeid = ino;
+    /*
+     * Since we need the name of the file/dir as an argument to the
+     * inotify_add_watch system call, we need to get a name that
+     * corresponds to the inode. So use readlinkat
+     */
+
+    lo = lo_data(req);
+    snprintf(procname, 64, "%i", inode->fd);
+    ret = readlinkat(lo->proc_self_fd, procname, linkname, 256);
+    if (ret < 0) {
+	fuse_log(FUSE_LOG_ERR, "%s: readlinkat failed\n", __func__);
+	goto cleanup_keys;
+    }
+    linkname[ret] = '\0';
+    
+    /* Allocate memory for the file_handle */;
+    f_handle = g_malloc0(sizeof(struct file_handle) +
+                         MAX_HANDLE_SZ);
+
+    f_handle->handle_bytes = 0;
+    ret = name_to_handle_at(dirfd, linkname, f_handle, &mnt_id, 0);
+    if (ret < 0) {
+	fuse_log(FUSE_LOG_ERR, "%s: name_to_handle_at failed\n", __func__);
+	goto cleanup_keys;
+    }
 
     /* Action 0: Remove watch, Action 1: Add/modify watch */
     switch (mask) {
         /* Remove the watch */
         case 0:
-            /*
-             * First check if a watch descriptor is already placed on the inode
-             * so that it is removed. If not then that is an invalid request
-             * from the guest so return an error
-             */
-
-            if (inode->fsnotify_watch == -1) {
-                fuse_log(FUSE_LOG_ERR, "%s: Invalid watch descriptor to be"
-                         " removed from inode %lu\n", __func__, ino);
-                errno = EINVAL;
-                goto cleanup_keys;
-            }
-            /* Get the existing watch */
-            wd = inode->fsnotify_watch;
-            fuse_log(FUSE_LOG_DEBUG, "%s: Removing watch %d\n", __func__, wd);
-
             /* Remove the watch now */
-            ret = inotify_rm_watch(inotify_fd->fd, wd);
+            ret = fanotify_mark(inotify_fd->fd, FAN_MARK_REMOVE, mask, AT_FDCWD, linkname);
             if (ret < 0) {
-                fuse_log(FUSE_LOG_ERR, "%s: Failed to remove watch"
-                         " descriptor %d\n", __func__, wd);
+                fuse_log(FUSE_LOG_ERR, "%s: Failed to remove mark"
+                         " from file %d\n", __func__, linkname);
                 /*
                  * Ignore the error for now. Probably it means that the kernel
                  * deleted the watches on the inode prior to us so no need to
@@ -809,30 +808,14 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask, uint32_t 
             }
 
             /* Now try to remove the keys/values from the hashtables */
-            cleanup_hashtables(se, inotify_fd->fd, wd);
-	    inode->fsnotify_watch = -1;
-
+            cleanup_hashtables(se, inotify_fd->fd, linkname);
             break;
         default:
-            /*
-             * Since we need the name of the file/dir as an argument to the
-             * inotify_add_watch system call, we need to get a name that
-             * corresponds to the inode. So use readlinkat
-             */
-
-            lo = lo_data(req);
-            snprintf(procname, 64, "%i", inode->fd);
-            ret = readlinkat(lo->proc_self_fd, procname, linkname, 256);
-            if (ret < 0) {
-                fuse_log(FUSE_LOG_ERR, "%s: readlinkat failed\n", __func__);
-                goto cleanup_keys;
-            }
-            linkname[ret] = '\0';
 
             fuse_log(FUSE_LOG_DEBUG, "%s: Adding a watch to file %s\n",
                      __func__, linkname);
             /* Add a watch to the file (inode) */
-            wd = inotify_add_watch(inotify_fd->fd, linkname, mask);
+            wd = fanotify_mark(inotify_fd->fd, FAN_MARK_ADD, mask, AT_FDCWD, linkname);
             if (wd < 0) {
                 fuse_log(FUSE_LOG_ERR, "%s: Failed to add watch"
                          " descriptor on inode %lu\n", __func__, ino);
@@ -842,7 +825,7 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask, uint32_t 
             /* Key for watch to inode mapping */
             wd_key = g_new0(struct inotify_wd_key, 1);
             wd_key->inotify_fd = inotify_fd->fd;
-            wd_key->wd = wd;
+            wd_key->f_handle = f_handle;
 
             /*
              * Checking if the watch is already mapped to the inode. If yes
@@ -870,8 +853,6 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask, uint32_t 
              */
             g_hash_table_insert(se->inotify->wd_to_inode, wd_key,
                                 inode_exists);
-            /*g_hash_table_insert(se->inotify->inode_to_wd, inode_key,*/
-                                /*GUINT_TO_POINTER(wd));*/
 
             inode->fsnotify_watch = wd;
             /*
@@ -883,9 +864,7 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask, uint32_t 
     }
 
 cleanup_keys:
-    /*if (inode_key) {*/
-        /*g_free(inode_key);*/
-    /*}*/
+    g_free(f_handle);
     if (wd_key) {
         g_free(wd_key);
     }
@@ -917,11 +896,17 @@ out:
  */
 static void lo_handle_events(struct fuse_session *se, int fd)
 {
-    char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
-    const struct inotify_event *event;
     struct fuse_inode_info *inode_info;
+    struct fanotify_event_metadata buf[200];
+    const struct fanotify_event_metadata *metadata;
+    struct file_handle *file_handle;
+    struct fanotify_event_info_fid *fid;
+    int event_fd;
+    /*char procfd_path[PATH_MAX];*/
+    /*char path[PATH_MAX];*/
+    /*ssize_t path_len;*/
+    char *filename;
     ssize_t len;
-    int wd;
 
     for (;;) {
 
@@ -946,15 +931,66 @@ static void lo_handle_events(struct fuse_session *se, int fd)
          * guarantee that the inode goes away while we are sending the
          * notifications
          */
-        for (char *ptr = buf; ptr < buf + len;
-             ptr += sizeof(struct inotify_event) + event->len) {
+        for (metadata = buf; FAN_EVENT_OK(metadata, len);
+             metadata = FAN_EVENT_NEXT(metadata, len)) {
 
-            event = (const struct inotify_event *) ptr;
-            wd = event->wd;
+            fid = (struct fanotify_event_info_fid *) (metadata + 1);
+            file_handle = (struct file_handle *) fid->handle;
+
+            if (metadata->vers != FANOTIFY_METADATA_VERSION) {
+                fuse_log(FUSE_LOG_ERR, "%s: Fanotify metadata mismatch\n",
+                         __func__);
+                goto unlock;
+            }
+
+            if (fid->hdr.info_type == FAN_EVENT_INFO_TYPE_FID ||
+                fid->hdr.info_type == FAN_EVENT_INFO_TYPE_DFID) {
+                file_name == NULL;
+	    } else if (fid->hdr.info_type == FAN_EVENT_INFO_TYPE_DFID_NAME) {
+                    file_name = file_handle->f_handle +
+                                file_handle->handle_bytes;
+	    } else {
+                break;
+            }
+
+            /*event_fd = open_by_handle_at(mount_fd, file_handle, O_RDONLY);*/
+            /*if (event_fd == -1) {*/
+                /*if (errno == ESTALE) {*/
+                    /*fuse_log(FUSE_LOG_ERR, "%s: File deleted and no longer"*/
+                             /*"valid\n", __func__);*/
+                    /*continue;*/
+                /*} else {*/
+                    /*fuse_log(FUSE_LOG_ERR, "%s: open_by_handle_at error",*/
+                             /*__func__);*/
+                    /*break;*/
+                /*}*/
+            /*}*/
+
+            /*snprintf(procfd_path, sizeof(procfd_path), "/proc/self/fd/%d",*/
+                     /*event_fd);*/
+
+            /*path_len = readlink(procfd_path, path, sizeof(path) - 1);*/
+            /*if (path_len == -1) {*/
+                /*fuse_log(FUSE_LOG_ERR, "%s: readlinkat failed\n", __func__);*/
+                /*break;*/
+            /*}*/
+            /*path[path_len] = '\0';*/
+
+
+            /*if (metadata->fd >= 0) {*/
+                /*snprintf(procfd_path, sizeof(procfd_path), "/proc/self/fd/%d",*/
+                         /*metadata->fd);*/
+                /*path_len = readlink(procfd_path, path, sizeof(path) -1);*/
+                /*if (path_len == -1) {*/
+                    /*fuse_log(FUSE_LOG_ERR, "%s: Error with readlink\n",*/
+                             /*__func__);*/
+                    /*goto unlock;*/
+                /*}*/
+                /*path[path_len] = '\0';*/
 
             struct inotify_wd_key wd_key = {
                 .inotify_fd = fd,
-                .wd = wd,
+                .f_handle = f_handle,
             };
 
             /*
@@ -963,7 +999,13 @@ static void lo_handle_events(struct fuse_session *se, int fd)
              * the event so do not create a notification
              */
             fuse_log(FUSE_LOG_DEBUG, "%s: Virtiofsd received an event for fd %d"
-                     " watch %d and mask %lld\n", __func__, fd, wd, event->mask);
+                     " file %s and mask %lld\n", __func__, fd, path, metadata->mask);
+
+            /*
+            * First find the inode the event corresponds to. If the inode
+            * does not exist it means it was deleted while we were reading
+            * the event so do not create a notification
+            */
             inode_info = g_hash_table_lookup(se->inotify->wd_to_inode, &wd_key);
 
             if (!inode_info) {
@@ -971,11 +1013,14 @@ static void lo_handle_events(struct fuse_session *se, int fd)
             }
 
             /* Everything is good so far so send the event to the guest */
-            fuse_lowlevel_notify_fsnotify(se, event->len, event->name,
-                                          event->mask, event->cookie,
-                                          inode_info->nodeid, inode_info->generation);
+            fuse_lowlevel_notify_fsnotify(se, metadata->metadata_len, path,
+                                          metadata->mask, 0,
+                                          inode_info->nodeid,
+                                          inode_info->generation);
+
+            close(metadata->fd);
         }
-        pthread_mutex_unlock(&se->inotify->i_lock);
+            pthread_mutex_unlock(&se->inotify->i_lock);
     }
 
 unlock:

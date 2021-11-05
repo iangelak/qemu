@@ -128,7 +128,7 @@ struct inotify_inode_key {    /* Inode to watch mapping */
 
 struct inotify_wd_key {       /* Watch to inode mapping */
 	int inotify_fd;
-	int wd;
+	struct file_handle *f_handle;
 };
 
 int fuse_send_reply_iov_nofree(fuse_req_t req, int error, struct iovec *iov,
