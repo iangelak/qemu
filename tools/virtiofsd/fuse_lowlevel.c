@@ -1620,6 +1620,7 @@ static void do_fsnotify(fuse_req_t req, fuse_ino_t nodeid,
 {
     struct fuse_notify_fsnotify_in *arg;
     uint32_t mask;
+    uint32_t generation;
 
     arg = fuse_mbuf_iter_advance(iter, sizeof(*arg));
     if (!arg) {
@@ -1628,9 +1629,10 @@ static void do_fsnotify(fuse_req_t req, fuse_ino_t nodeid,
     }
 
     mask = arg->mask;
+    generation = arg->generation;
 
     if (req->se->op.fsnotify) {
-        req->se->op.fsnotify(req, nodeid, mask);
+        req->se->op.fsnotify(req, nodeid, mask, generation);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -2229,7 +2231,7 @@ int fuse_lowlevel_notify_lock(struct fuse_session *se, uint64_t unique,
 int fuse_lowlevel_notify_fsnotify(struct fuse_session *se,
                                   uint32_t name_len, const char *pathname,
                                   uint64_t mask, uint32_t cookie,
-                                  fuse_ino_t ino)
+                                  fuse_ino_t ino, uint32_t generation)
 {
     struct fuse_notify_fsnotify_out outarg = {0};
     struct iovec iov[3];
@@ -2239,6 +2241,7 @@ int fuse_lowlevel_notify_fsnotify(struct fuse_session *se,
     outarg.inode = ino;
     outarg.namelen = name_len;
     outarg.cookie = cookie;
+    outarg.generation = generation;
 
     iov[1].iov_base = &outarg;
     iov[1].iov_len = sizeof(outarg);

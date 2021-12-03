@@ -55,6 +55,11 @@ struct fuse_inotify_fd {
     uint64_t refcount;
 };
 
+struct fuse_inode_info {
+	fuse_ino_t nodeid;
+	uint32_t generation;
+};
+
 /*
  * Store all the inotify instances created by vitiofsd as wellas the mappings
  * from inodes to watches and vice versa

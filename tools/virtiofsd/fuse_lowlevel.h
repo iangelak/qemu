@@ -1239,10 +1239,9 @@ struct fuse_lowlevel_ops {
      * @param req request handle
      * @param ino the inode number
      * @param mask the watch mask attached to the inode
-     * @param action to be performed: add, remove, modify a watch
-     * @param group unique identifier related to each event monitoring instance
+     * @param generation the generation identifier for the inode
      */
-    void (*fsnotify)(fuse_req_t req, fuse_ino_t ino, uint32_t mask);
+    void (*fsnotify)(fuse_req_t req, fuse_ino_t ino, uint32_t mask, uint32_t generation);
 };
 
 /**
@@ -1255,7 +1254,7 @@ struct fuse_lowlevel_ops {
  * documented error conditions in the corresponding system calls
  * manpage.
  *
- * An error code of ENOSYS is sometimes treated specially. This is
+ fuse_lowlevel_notify_fsnotify* An error code of ENOSYS is sometimes treated specially. This is
  * indicated in the documentation of the affected handler functions.
  *
  * The following requests may be answered with a zero error code:
@@ -1744,7 +1743,7 @@ int fuse_lowlevel_notify_lock(struct fuse_session *se, uint64_t unique,
  */
 int fuse_lowlevel_notify_fsnotify(struct fuse_session *se, uint32_t name_len,
                                   const char *pathanme, uint64_t mask,
-                                  uint32_t cookie, fuse_ino_t ino);
+                                  uint32_t cookie, fuse_ino_t ino, uint32_t generation);
 
 /*
  * Utility functions

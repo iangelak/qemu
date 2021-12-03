@@ -718,19 +718,17 @@ static void cleanup_hashtables(struct fuse_session *se, int inotify_fd,
     /*}*/
 }
 
-static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
+static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask, uint32_t generation)
 {
     struct fuse_session *se = req->se;
     struct fuse_inotify_fd *inotify_fd = NULL;
-    struct inotify_inode_key *inode_key = NULL;
     struct inotify_wd_key *wd_key = NULL;
     struct lo_data *lo;
     struct lo_inode *inode;
     char procname[64];
     char linkname[256];
     int ret = -1, wd;
-    int *inode_exists;
-    /*int *wd_exists;*/
+    struct fuse_inode_info *inode_exists;
     uint64_t group = 0;
 
     if (mask && !(mask & FUSE_FSNOTIFY_SUPPORTED)) {
@@ -739,6 +737,7 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
         goto out;
     }
 
+    fuse_log(FUSE_LOG_ERR, "%s: Got a request for inode %llu with generation %lu and mask %lu\n", __func__, ino, generation, mask);
     pthread_mutex_lock(&se->inotify->i_lock);
 
     /* First search the hash table for the inotify instance */
@@ -765,9 +764,9 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
     }
 
     /* Key for inode to watch mapping */
-    inode_key = g_new0(struct inotify_inode_key, 1);
-    inode_key->inotify_fd = inotify_fd->fd;
-    inode_key->nodeid = ino;
+    // inode_key = g_new0(struct inotify_inode_key, 1);
+    // inode_key->inotify_fd = inotify_fd->fd;
+    // inode_key->nodeid = ino;
 
     /* Action 0: Remove watch, Action 1: Add/modify watch */
     switch (mask) {
@@ -858,6 +857,10 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
                 goto cleanup_keys;
             }
 
+            inode_exists = g_new0(struct fuse_inode_info, 1);
+            inode_exists->nodeid = ino;
+            inode_exists->generation = generation;
+
             /*
              * Add a map from the watch to the inode and one map from the inode
              * to the watch. These will be used to quickly find which watch
@@ -866,7 +869,7 @@ static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
              * have a watch on the same inode
              */
             g_hash_table_insert(se->inotify->wd_to_inode, wd_key,
-                                GUINT_TO_POINTER(ino));
+                                inode_exists);
             /*g_hash_table_insert(se->inotify->inode_to_wd, inode_key,*/
                                 /*GUINT_TO_POINTER(wd));*/
 
@@ -903,6 +906,7 @@ out:
         close(inotify_fd->fd);
     }
 
+    lo_inode_put(lo, &inode);
     pthread_mutex_unlock(&se->inotify->i_lock);
     fuse_reply_err(req, ret < 0 ? errno : 0);
 }
@@ -915,7 +919,7 @@ static void lo_handle_events(struct fuse_session *se, int fd)
 {
     char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
     const struct inotify_event *event;
-    fuse_ino_t *nodeid;
+    struct fuse_inode_info *inode_info;
     ssize_t len;
     int wd;
 
@@ -960,16 +964,16 @@ static void lo_handle_events(struct fuse_session *se, int fd)
              */
             fuse_log(FUSE_LOG_DEBUG, "%s: Virtiofsd received an event for fd %d"
                      " watch %d and mask %lld\n", __func__, fd, wd, event->mask);
-            nodeid = g_hash_table_lookup(se->inotify->wd_to_inode, &wd_key);
+            inode_info = g_hash_table_lookup(se->inotify->wd_to_inode, &wd_key);
 
-            if (!nodeid) {
+            if (!inode_info) {
                 continue;
             }
 
             /* Everything is good so far so send the event to the guest */
             fuse_lowlevel_notify_fsnotify(se, event->len, event->name,
                                           event->mask, event->cookie,
-                                          GPOINTER_TO_UINT(nodeid));
+                                          inode_info->nodeid, inode_info->generation);
         }
         pthread_mutex_unlock(&se->inotify->i_lock);
     }
